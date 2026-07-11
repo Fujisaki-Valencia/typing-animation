@@ -13,15 +13,17 @@ interface Bubble {
   fontSize: number
   duration: number
   riseDelay: number
-  riseDistanceVh: number
+  riseDistancePx: number
   rotate: number
 }
 
 interface WordProfile {
   left: number
   fontSize: number
+  charAdvance: number
   duration: number
   startTime: number
+  riseDistancePx: number
 }
 
 interface ActiveSlot {
@@ -36,9 +38,46 @@ const DEFAULT_SPAWN_WIDTH_PERCENT = 50
 const MIN_GAP_PERCENT = 9
 const PLACEMENT_ATTEMPTS = 24
 
+// bubbles are never allowed to rise past this fraction of the viewport height,
+// so long/large-font words can't climb above the visible screen
+const SAFE_MAX_PERCENT = 92
+const MIN_RISE_PERCENT_CHAR = 18
+const MIN_RISE_PERCENT_SPARKLE = 6
+// how tall a word's vertical column (tategaki stacking) may be, before it even
+// starts rising -- without this, long words at large font sizes could start
+// off-screen above the top on their own
+const MAX_COLUMN_PERCENT = 55
+
 const SPARKLE_SYMBOLS = ['*', '+', '・']
 
 const randomBetween = (min: number, max: number) => min + Math.random() * (max - min)
+
+// getBoundingClientRect().top reflects the glyph's own rendered height too, not
+// just its anchor position -- budget for that so the visible top edge, not just
+// the CSS anchor point, stays under SAFE_MAX_PERCENT of the viewport
+const glyphAllowancePx = (fontSize: number) => fontSize * 1.3
+
+// the highest an element's bottom-anchor (bottomOffsetPx + rise) may reach,
+// once its own rendered height is taken into account
+const safeMaxAnchorPx = (fontSize: number) =>
+  Math.max(
+    window.innerHeight * (SAFE_MAX_PERCENT / 100) - glyphAllowancePx(fontSize),
+    window.innerHeight * 0.2
+  )
+
+// caps how far up (in px) something starting at startBottomOffsetPx may rise
+// before its top edge would cross the safe ceiling
+const safeRiseDistancePx = (
+  desiredRisePx: number,
+  startBottomOffsetPx: number,
+  minRisePercent: number,
+  fontSize: number
+) => {
+  const ceilingPx = safeMaxAnchorPx(fontSize)
+  const minRisePx = window.innerHeight * (minRisePercent / 100)
+  const allowedRisePx = Math.max(ceilingPx - startBottomOffsetPx, minRisePx)
+  return -Math.min(desiredRisePx, allowedRisePx)
+}
 
 // picks a left position for a new word that keeps it clear of columns still rising,
 // so back-to-back typing doesn't spawn overlapping columns
@@ -66,26 +105,49 @@ const pickLeft = (activeSlots: ActiveSlot[], spawnMin: number, spawnMax: number)
 const createWordProfile = (
   activeSlots: ActiveSlot[],
   fontScale: number,
-  spawnWidthPercent: number
+  spawnWidthPercent: number,
+  total: number
 ): WordProfile => {
   const now = performance.now()
   const duration = randomBetween(2.4, 4.2)
   const spawnMin = 50 - spawnWidthPercent / 2
   const spawnMax = 50 + spawnWidthPercent / 2
   const left = pickLeft(activeSlots.filter(slot => slot.expiresAt > now), spawnMin, spawnMax)
+  const fontSize = randomBetween(28, 96) * fontScale
+
+  // the first-typed character sits highest in the column (see createCharBubble);
+  // half the word's characters span from center to that topmost character
+  const topmostHalfSpan = (total - 1) / 2
+  const idealCharAdvance = fontSize * CHAR_ADVANCE_RATIO
+  const maxColumnPx = safeMaxAnchorPx(fontSize) * (MAX_COLUMN_PERCENT / SAFE_MAX_PERCENT)
+  // compress letter-spacing for very long/large-font words so the column itself
+  // never starts taller than the safe budget, regardless of rise animation
+  const charAdvance =
+    topmostHalfSpan > 0
+      ? Math.min(idealCharAdvance, maxColumnPx / topmostHalfSpan)
+      : idealCharAdvance
+  const topmostStartOffsetPx = topmostHalfSpan * charAdvance
+
+  const riseDistancePx = safeRiseDistancePx(
+    window.innerHeight * 0.5,
+    topmostStartOffsetPx,
+    MIN_RISE_PERCENT_CHAR,
+    fontSize
+  )
 
   return {
     left,
-    fontSize: randomBetween(28, 96) * fontScale,
+    fontSize,
+    charAdvance,
     duration,
-    startTime: now
+    startTime: now,
+    riseDistancePx
   }
 }
 
 const createCharBubble = (message: BubbleMessage, profile: WordProfile): Bubble => {
-  const charAdvance = profile.fontSize * CHAR_ADVANCE_RATIO
   // first-typed character sits at the top of the column, later characters trail below it
-  const bottomOffsetPx = ((message.total - 1) / 2 - message.index) * charAdvance
+  const bottomOffsetPx = ((message.total - 1) / 2 - message.index) * profile.charAdvance
   // later characters appear after a delay; a matching negative rise-delay keeps
   // the whole column climbing on the same clock instead of drifting apart
   const riseDelay = -(performance.now() - profile.startTime) / 1000
@@ -98,7 +160,7 @@ const createCharBubble = (message: BubbleMessage, profile: WordProfile): Bubble 
     fontSize: profile.fontSize,
     duration: profile.duration,
     riseDelay,
-    riseDistanceVh: -50,
+    riseDistancePx: profile.riseDistancePx,
     rotate: 0
   }
 }
@@ -108,22 +170,31 @@ const createSparkles = (
   profile: WordProfile,
   fontScale: number
 ): Bubble[] => {
-  const charAdvance = profile.fontSize * CHAR_ADVANCE_RATIO
-  const charBottomOffsetPx = ((message.total - 1) / 2 - message.index) * charAdvance
+  const charBottomOffsetPx = ((message.total - 1) / 2 - message.index) * profile.charAdvance
   const count = Math.random() < 0.5 ? 1 : 2
 
-  return Array.from({ length: count }, (_, i) => ({
-    id: `${message.id}-sparkle-${i}`,
-    text: SPARKLE_SYMBOLS[Math.floor(Math.random() * SPARKLE_SYMBOLS.length)],
-    kind: 'sparkle' as const,
-    left: profile.left + randomBetween(-4, 4),
-    bottomOffsetPx: charBottomOffsetPx + randomBetween(-charAdvance * 0.4, charAdvance * 0.4),
-    fontSize: randomBetween(8, 18) * fontScale,
-    duration: randomBetween(1, 2),
-    riseDelay: 0,
-    riseDistanceVh: -randomBetween(10, 22),
-    rotate: randomBetween(-25, 25)
-  }))
+  return Array.from({ length: count }, (_, i) => {
+    const bottomOffsetPx =
+      charBottomOffsetPx + randomBetween(-profile.charAdvance * 0.4, profile.charAdvance * 0.4)
+    const sparkleFontSize = randomBetween(8, 18) * fontScale
+    return {
+      id: `${message.id}-sparkle-${i}`,
+      text: SPARKLE_SYMBOLS[Math.floor(Math.random() * SPARKLE_SYMBOLS.length)],
+      kind: 'sparkle' as const,
+      left: profile.left + randomBetween(-4, 4),
+      bottomOffsetPx,
+      fontSize: sparkleFontSize,
+      duration: randomBetween(1, 2),
+      riseDelay: 0,
+      riseDistancePx: safeRiseDistancePx(
+        randomBetween(10, 22) / 100 * window.innerHeight,
+        bottomOffsetPx,
+        MIN_RISE_PERCENT_SPARKLE,
+        sparkleFontSize
+      ),
+      rotate: randomBetween(-25, 25)
+    }
+  })
 }
 
 const openInputWindow = () => {
@@ -158,7 +229,12 @@ function DisplayView() {
         if (!profile) {
           const now = performance.now()
           activeSlots.current = activeSlots.current.filter(slot => slot.expiresAt > now)
-          profile = createWordProfile(activeSlots.current, fontScale.current, spawnWidthPercent.current)
+          profile = createWordProfile(
+            activeSlots.current,
+            fontScale.current,
+            spawnWidthPercent.current,
+            message.total
+          )
           wordProfiles.current.set(message.wordId, profile)
           activeSlots.current.push({
             left: profile.left,
@@ -220,7 +296,7 @@ function DisplayView() {
                 '--y-offset': `${bubble.bottomOffsetPx}px`,
                 '--duration': `${bubble.duration}s`,
                 '--rise-delay': `${bubble.riseDelay}s`,
-                '--rise-distance': `${bubble.riseDistanceVh}vh`
+                '--rise-distance': `${bubble.riseDistancePx}px`
               } as React.CSSProperties
             }
             onAnimationEnd={() => bubble.kind === 'char' && removeBubble(bubble.id)}
